@@ -1,0 +1,10 @@
+{
+  "version": "1.5.0",
+  "channel": "stable",
+  "url": "https://raw.githubusercontent.com/envi-central/envi-central/main/Project_4_Test5.py",
+  "sha256": "15940f2af776976d8407decd97584d822116566842bdfbfb885fff0d92d25f35",
+  "size": 456743,
+  "date": "2026-07-22",
+  "mandatory": false,
+  "changelog": "test update"
+}
