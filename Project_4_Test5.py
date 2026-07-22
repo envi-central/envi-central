@@ -11,7 +11,6 @@
 from flask import Flask, render_template_string, request, jsonify, Response
 from pymodbus.client.sync import ModbusSerialClient as ModbusClient
 import threading, time, os, subprocess, socket, shutil, glob
-import sys, hashlib
 from flask import send_from_directory
 import mmap, struct
 from collections import deque
@@ -24,43 +23,7 @@ from PIL import Image, ImageDraw, ImageFont
 import random
 import sqlite3
 
-# ══════════════════════════════════════════════════════════════════════════════
-# PRODUCT VERSION & OVER-THE-AIR UPDATE / HEALTH CONFIG
-# ══════════════════════════════════════════════════════════════════════════════
-APP_VERSION    = "1.5.0"                    # bump on every release
-APP_BUILD_DATE = "2026-07-22"              # release/build date
-APP_CHANNEL    = "stable"                   # stable | beta
-
-# Where the panel checks for new firmware. Point this at a small JSON manifest you
-# host (GitHub Releases raw URL, S3, your web server …). See build_release.py /
-# latest.json for the format. Can be overridden per-unit via the ENV var below.
-UPDATE_MANIFEST_URL = os.environ.get(
-    "ENVI_UPDATE_URL",
-    "https://raw.githubusercontent.com/insightcontrol/envi-central/main/latest.json")
-
-# The systemd service that runs this app (used to restart cleanly after an update
-# and to feed the watchdog). Override with ENVI_SERVICE if you named it differently.
-ENVI_SERVICE   = os.environ.get("ENVI_SERVICE", "envi-panel")
-
-# The running script + its sidecar files. The updater replaces APP_FILE atomically
-# and keeps APP_FILE + '.prev' as a one-click rollback. update_state.json records
-# the in-flight update so a bad build can be auto-reverted on the next boot.
-APP_FILE          = os.path.realpath(sys.argv[0] if (len(sys.argv) and sys.argv[0]) else __file__)
-UPDATE_STATE_FILE = "/home/linaro/envi_update_state.json"
-
-# Chromium memory guard: if the kiosk browser's RSS exceeds this, the watchdog
-# restarts just Chromium (never the whole panel). 0 = disabled. ~1.1 GB suits a
-# 2–4 GB board and multi-week uptime.
-CHROMIUM_MAX_RSS_MB = int(os.environ.get("ENVI_CHROMIUM_MAX_RSS_MB", "1100"))
-
-# Live update progress, surfaced to the UI via /api/update_status.
-_update_status = {"stage": "idle", "message": "", "progress": 0,
-                  "current": APP_VERSION, "latest": None, "changelog": "",
-                  "available": False, "ts": 0}
-_update_lock   = threading.Lock()
-_app_start_mono = time.monotonic()
-
-
+# ── Occupancy Variables ─────────────────────────────────────────────────────────────────────
 OCCUPANCY_DB = "/home/linaro/occupancy.db"
 occupancy_manual_override = {"active": False, "until": 0}  # manual "occupied now"
 
@@ -121,13 +84,6 @@ def make_empty_week():
     return {"Mon":[],"Tue":[],"Wed":[],"Thu":[],"Fri":[],"Sat":[],"Sun":[]}
 
 app = Flask(__name__)
-
-# Quiet Werkzeug's per-request access log. The panel polls /read and /api/clock
-# every second, so the default logger would write ~170,000 lines/day to journald
-# and wear the eMMC. Real problems (tracebacks, 5xx) still log; so do our own
-# [TAG] prints. Flip to INFO temporarily if you ever need to trace requests.
-import logging
-logging.getLogger('werkzeug').setLevel(logging.WARNING)
 
 @app.after_request
 def no_cache(resp):
@@ -451,39 +407,58 @@ import tempfile
 from datetime import datetime
 from PIL import Image, ImageDraw, ImageFont
 
-def screen_sleep():
-    global screen_on, overlay_proc
-    if not screen_on:
-        return
-    env = get_display_env()
-    now = datetime.now()
-    time_txt = now.strftime("%I:%M %p")
-    date_txt = now.strftime("%d %b %Y")
+def _draw_screensaver_png(path="/tmp/screensaver.png"):
+    # Same source the dashboard uses, so both always show the identical time/date.
+    with clock_lock:
+        time_txt = (clock_data.get("time", "") + " " + clock_data.get("ampm", "")).strip()
+        date_txt = clock_data.get("date", "")
     W, H = 1280, 800
     bg = Image.new("RGB", (W, H), "black")
     logo = Image.open("/home/linaro/logo.png").convert("RGBA")
     logo_w = 500
     ratio = logo_w / logo.width
-    logo_h = int(logo.height * ratio)
-    logo = logo.resize((logo_w, logo_h))
-    bg.paste(logo, ((W - logo_w) // 2, (H - logo_h) // 2 - 80), logo)
+    logo = logo.resize((logo_w, int(logo.height * ratio)))
+    bg.paste(logo, ((W - logo_w) // 2, (H - logo.height) // 2 - 80), logo)
     draw = ImageDraw.Draw(bg)
     try:
         font_time = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", 64)
         font_date = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", 36)
-    except:
-        font_time = ImageFont.load_default()
-        font_date = ImageFont.load_default()
-    bbox = draw.textbbox((0, 0), time_txt, font=font_time)
-    tw = bbox[2] - bbox[0]
+    except Exception:
+        font_time = ImageFont.load_default(); font_date = ImageFont.load_default()
+    tw = draw.textbbox((0, 0), time_txt, font=font_time)[2]
     draw.text(((W - tw) // 2, (H // 2) + 120), time_txt, fill="white", font=font_time)
-    bbox = draw.textbbox((0, 0), date_txt, font=font_date)
-    dw = bbox[2] - bbox[0]
+    dw = draw.textbbox((0, 0), date_txt, font=font_date)[2]
     draw.text(((W - dw) // 2, (H // 2) + 200), date_txt, fill="white", font=font_date)
-    tmp_file = "/tmp/screensaver.png"
-    bg.save(tmp_file)
-    overlay_proc = subprocess.Popen(["feh", "-F", "--hide-pointer", "--auto-zoom", tmp_file], env=env)
+    tmp = path + ".tmp"
+    bg.save(tmp, "PNG")
+    os.replace(tmp, path)      # atomic: feh only ever sees a complete file
+
+def _screensaver_refresher():
+    last = None
+    while not screen_on:
+        time.sleep(1)
+        if screen_on:
+            break
+        with clock_lock:
+            cur = clock_data.get("time", "") + clock_data.get("date", "")
+        if cur != last:
+            try:
+                _draw_screensaver_png()   # atomic write from edit last round
+                last = cur
+            except Exception:
+                pass
+
+def screen_sleep():
+    global screen_on, overlay_proc
+    if not screen_on:
+        return
+    env = get_display_env()
+    _draw_screensaver_png()
     screen_on = False
+    overlay_proc = subprocess.Popen(
+        ["feh", "-F", "--hide-pointer", "--auto-zoom", "--reload", "1", "/tmp/screensaver.png"],
+        env=env)
+    threading.Thread(target=_screensaver_refresher, daemon=True).start()
 
 def screen_wake():
     global screen_on, overlay_proc
@@ -2393,7 +2368,6 @@ def open_browser():
     _wait_for_chromium_window(env, timeout=15)
     close_splash()
 
-
 # ── Kiosk health watchdog ───────────────────────────────────────────────────
 # Chromium already runs in --kiosk, but on a live install a few things can still
 # appear OVER it — most commonly NetworkManager's "Wi-Fi Network Authentication
@@ -2480,26 +2454,6 @@ def _chromium_alive():
     except Exception:
         return True     # assume alive on error — don't relaunch on a false negative
 
-def _chromium_rss_mb():
-    """Total resident memory (MB) of all Chromium processes, or 0 if unknown."""
-    try:
-        r = subprocess.run(['pgrep', '-f', 'chromium'], capture_output=True, text=True, timeout=3)
-        pids = [p for p in r.stdout.split() if p.strip()]
-        if not pids:
-            return 0
-        total_kb = 0
-        for pid in pids:
-            try:
-                with open(f'/proc/{pid}/statm') as f:
-                    # field 2 = resident set size in pages
-                    rss_pages = int(f.read().split()[1])
-                total_kb += rss_pages * (os.sysconf('SC_PAGE_SIZE') // 1024)
-            except Exception:
-                pass
-        return total_kb // 1024
-    except Exception:
-        return 0
-
 def _reload_kiosk(env):
     """Optional: reload the page in place (no blackout, no boot logo)."""
     tool = _win_tool()
@@ -2560,22 +2514,13 @@ def kiosk_watchdog_thread():
                     print("[KIOSK] Chromium not running — relaunching", flush=True)
                     open_browser()
                     last_launch = time.monotonic()
-            # Memory guard: restart just Chromium if it bloats (multi-week uptime).
-            elif (CHROMIUM_MAX_RSS_MB and (time.monotonic() - start) > 60
-                  and (time.monotonic() - last_launch) > 120):
-                rss = _chromium_rss_mb()
-                if rss and rss > CHROMIUM_MAX_RSS_MB:
-                    print(f"[KIOSK] Chromium RSS {rss}MB > {CHROMIUM_MAX_RSS_MB}MB — recycling", flush=True)
-                    open_browser()
-                    last_launch = time.monotonic()
             if KIOSK_RELOAD_HOURS and (time.monotonic() - last_reload) > KIOSK_RELOAD_HOURS * 3600:
                 _reload_kiosk(env)
                 last_reload = time.monotonic()
         except Exception as e:
             print(f"[KIOSK] watchdog error: {e}", flush=True)
         time.sleep(3)
-
-
+        
 # ─────────────────────────────────────────────────────────────────────────────
 # HTML
 # ─────────────────────────────────────────────────────────────────────────────
@@ -4036,7 +3981,7 @@ body.theme-dark .lr-table tr{border-color:var(--d-line)!important;}
           <label style="font-size:11px;color:#888;text-transform:uppercase;">Baud Rate</label>
           <select id="cfg-baud" style="padding:5px 8px;border:1px solid #ccc;border-radius:5px;font-size:12px;">
             <option value="9600" selected>9600</option>
-            <option value="19200" selected>19200</option>
+            <option value="19200">19200</option>
             <option value="38400">38400</option>
           </select>
           <button class="serial-save-btn" onclick="saveSerialConfig()">Apply Port</button>
@@ -4333,25 +4278,6 @@ Mode (0=Auto,1=Cool,2=Heat,3=Fan)\nReg 2: Fan Speed\nReg 4: Setpoint\nReg 5: Roo
       <button onclick="setTheme('dark')"  id="theme-btn-dark"  class="theme-btn" style="flex:1;padding:14px 8px;background:#0f172a;color:#e2e8f0;border:2px solid transparent;border-radius:10px;font-size:13px;font-weight:bold;cursor:pointer;">🌙 Dark</button>
     </div>
   </div>
-
-  <!-- ══ FIRMWARE / VERSION CONTROL ══ -->
-  <div style="background:rgba(255,255,255,0.08);border-radius:14px;padding:16px;width:85%;max-width:360px;margin-bottom:20px;">
-    <div style="font-size:11px;text-transform:uppercase;letter-spacing:2px;color:#94a3b8;margin-bottom:10px;text-align:center;">Firmware</div>
-    <div style="display:flex;align-items:center;justify-content:space-between;gap:8px;">
-      <div>
-        <div style="font-size:15px;font-weight:800;color:#fff;">ENVI Central <span id="fw-version">v—</span></div>
-        <div id="fw-build" style="font-size:11px;color:#94a3b8;">built —</div>
-      </div>
-      <button id="fw-update-btn" onclick="checkForUpdate()" style="padding:11px 16px;background:#2563eb;color:white;border:none;border-radius:10px;font-size:13px;font-weight:bold;cursor:pointer;white-space:nowrap;">Check for Updates</button>
-    </div>
-    <div id="fw-status" style="font-size:12px;color:#cbd5e1;margin-top:10px;display:none;"></div>
-    <div id="fw-progress-wrap" style="display:none;margin-top:10px;height:8px;background:rgba(255,255,255,0.12);border-radius:6px;overflow:hidden;">
-      <div id="fw-progress" style="height:100%;width:0%;background:#22c55e;transition:width .4s;"></div>
-    </div>
-    <div id="fw-changelog" style="display:none;margin-top:10px;font-size:12px;color:#e2e8f0;background:rgba(0,0,0,0.25);border-radius:8px;padding:10px;max-height:120px;overflow-y:auto;white-space:pre-wrap;"></div>
-    <button id="fw-install-btn" onclick="installUpdate()" style="display:none;width:100%;margin-top:12px;padding:13px;background:#16a34a;color:white;border:none;border-radius:10px;font-size:14px;font-weight:bold;cursor:pointer;">⬇ Download &amp; Install Update</button>
-  </div>
-
   <div style="display:flex;flex-direction:column;gap:14px;width:85%;max-width:360px;">
     <button onclick="executePower('restart')"  style="padding:18px;background:#f59e0b;color:white;border:none;border-radius:12px;font-size:16px;font-weight:bold;cursor:pointer;">Restart Display</button>
     <button onclick="executePower('shutdown')" style="padding:18px;background:#ef4444;color:white;border:none;border-radius:12px;font-size:16px;font-weight:bold;cursor:pointer;">Power Off</button>
@@ -6945,9 +6871,11 @@ function initChart(){
       interaction:{mode:'index',intersect:false},
       scales:{
         y:{beginAtZero:false,grace:'10%',grid:{color:cfg.gridColor,drawBorder:false},
-           ticks:{color:tickColor,font:{size:11},padding:6,callback:function(v){return v+'°';}}},
+           ticks:{color:tickColor,font:{size:11},padding:6,
+                  callback:function(v){return Number(v).toFixed(1)+'°';}}},   // 23.4, 28.3 …
         x:{grid:{color:cfg.gridColor,display:false,drawBorder:false},
-           ticks:{color:tickColor,maxTicksLimit:7,maxRotation:0,autoSkip:true,font:{size:10}}}
+           ticks:{color:tickColor,maxTicksLimit:7,maxRotation:0,autoSkip:true,font:{size:10},
+                  callback:function(v){return to12h(this.getLabelForValue(v));}}}   // 15:56 → 3:56
       },
       plugins:{
         legend:{position:'top',align:'end',labels:{color:tickColor,boxWidth:9,boxHeight:9,
@@ -6963,6 +6891,7 @@ function initChart(){
 // changing the Time Window visibly changes the chart even with little history.
 function _hm2min(s){ var p=(s||'0:0').split(':'); return (+p[0])*60+(+p[1]); }
 function _min2hm(m){ m=((m%1440)+1440)%1440; var h=Math.floor(m/60), mm=m%60; return (h<10?'0':'')+h+':'+(mm<10?'0':'')+mm; }
+function to12h(hm){ var p=(hm||'').split(':'); if(p.length<2) return hm; var h=+p[0]%12; if(h===0) h=12; return h+':'+p[1]; }
 function buildMinuteWindow(d, n){
   var labels=d.labels||[], temp=d.temp||[], sp=d.setpoint||[], co=d.co||[];
   var mapT={}, mapS={}, mapC={};
@@ -7092,79 +7021,8 @@ function closeFullscreenChart(){
 }
 
 // ── Power panel ───────────────────────────────────────────────────────────
-function showPowerPanel(){document.getElementById('power-panel').style.display='flex'; loadVersion();}
+function showPowerPanel(){document.getElementById('power-panel').style.display='flex';}
 function hidePowerPanel(){document.getElementById('power-panel').style.display='none';}
-
-// ── Firmware version + OTA update ──────────────────────────────────────────
-function loadVersion(){
-  fetch('/api/version').then(function(r){return r.json();}).then(function(d){
-    var v=document.getElementById('fw-version'); if(v) v.textContent='v'+d.version;
-    var b=document.getElementById('fw-build');   if(b) b.textContent='built '+d.build_date+(d.channel&&d.channel!=='stable'?(' · '+d.channel):'');
-  }).catch(function(){});
-}
-function _fwStatus(msg,color){
-  var s=document.getElementById('fw-status');
-  if(s){ s.style.display='block'; s.textContent=msg; s.style.color=color||'#cbd5e1'; }
-}
-function checkForUpdate(){
-  var btn=document.getElementById('fw-update-btn');
-  _fwStatus('Checking for updates…');
-  document.getElementById('fw-install-btn').style.display='none';
-  document.getElementById('fw-changelog').style.display='none';
-  if(btn){ btn.disabled=true; btn.textContent='Checking…'; }
-  fetch('/api/check_update').then(function(r){return r.json();}).then(function(d){
-    if(btn){ btn.disabled=false; btn.textContent='Check for Updates'; }
-    if(!d.ok){ _fwStatus(d.error||'Could not reach update server','#fca5a5'); return; }
-    if(d.available){
-      _fwStatus('✓ Update available: v'+d.latest+(d.mandatory?' (required)':''),'#86efac');
-      if(d.changelog){
-        var cl=document.getElementById('fw-changelog');
-        cl.style.display='block'; cl.textContent=d.changelog;
-      }
-      document.getElementById('fw-install-btn').style.display='block';
-    } else {
-      _fwStatus('✓ You are on the latest version (v'+d.current+')','#86efac');
-    }
-  }).catch(function(){
-    if(btn){ btn.disabled=false; btn.textContent='Check for Updates'; }
-    _fwStatus('Could not reach update server','#fca5a5');
-  });
-}
-var _fwPoll=null;
-function installUpdate(){
-  if(!confirm('Download and install the update now? The panel will restart automatically. This takes 1–2 minutes.')) return;
-  document.getElementById('fw-install-btn').style.display='none';
-  document.getElementById('fw-update-btn').style.display='none';
-  document.getElementById('fw-progress-wrap').style.display='block';
-  _fwStatus('Starting update…','#93c5fd');
-  fetch('/api/apply_update',{method:'POST'}).then(function(r){return r.json();}).then(function(d){
-    if(!d.ok){ _fwStatus(d.error||'Update failed to start','#fca5a5');
-               document.getElementById('fw-update-btn').style.display='inline-block'; return; }
-    if(_fwPoll) clearInterval(_fwPoll);
-    _fwPoll=setInterval(pollUpdate,1500);
-  }).catch(function(){ _fwStatus('Update failed to start','#fca5a5'); });
-}
-function pollUpdate(){
-  fetch('/api/update_status').then(function(r){return r.json();}).then(function(d){
-    var bar=document.getElementById('fw-progress');
-    if(bar) bar.style.width=(d.progress||0)+'%';
-    var label={downloading:'Downloading…',verifying:'Verifying…',installing:'Installing…',restarting:'Restarting into new version…',error:'Update failed'};
-    _fwStatus((label[d.stage]||d.message||'Working…')+(d.progress?(' '+d.progress+'%'):''),
-              d.stage==='error'?'#fca5a5':'#93c5fd');
-    if(d.stage==='error'){
-      clearInterval(_fwPoll); _fwPoll=null;
-      document.getElementById('fw-update-btn').style.display='inline-block';
-    }
-    if(d.stage==='restarting'){
-      clearInterval(_fwPoll); _fwPoll=null;
-      _fwStatus('Restarting into the new version… this page will reconnect shortly.','#86efac');
-      setTimeout(function(){ location.reload(); }, 45000);
-    }
-  }).catch(function(){
-    // During the service restart the endpoint is briefly unreachable — that's expected.
-    _fwStatus('Restarting… reconnecting shortly.','#86efac');
-  });
-}
 function executePower(type){
   if(confirm('Are you sure you want to '+type+'?')){
     document.getElementById('power-panel').innerHTML='<h1 style="color:white;">'+(type==='restart'?'Restarting...':'Shutting down...')+'</h1>';
@@ -7824,8 +7682,6 @@ def test_connection():
     if ctrl_idx >= len(cfg):
         return jsonify({'connected': False, 'msg': 'Invalid controller index'})
     roles    = roles_for(cfg[ctrl_idx])
-    temp_reg = roles['temp']
-    onoff_reg= roles['onoff']
     sc       = roles.get('scale', 1)
     slave_id = cfg[ctrl_idx]['slave_id']
     with lock: c = client
@@ -7834,12 +7690,12 @@ def test_connection():
             return jsonify({'connected': False, 'msg': f'Cannot open {PORT}'})
         with lock: c = client
     try:
-        r = c.read_holding_registers(address=temp_reg, count=1, unit=slave_id)
-        if r.isError():
+        raw = read_field(c, roles, 'temp', slave_id)   # honours temp_rtype (input/holding/coil)
+        if raw is None:
             return jsonify({'connected': False, 'msg': f'No response from slave {slave_id}'})
-        temp_val = r.registers[0] * sc
-        r2    = c.read_holding_registers(address=onoff_reg, count=1, unit=slave_id)
-        onoff = "ON" if (not r2.isError() and r2.registers[0] == 1) else "OFF"
+        temp_val = raw * sc
+        on_raw   = read_field(c, roles, 'onoff', slave_id)
+        onoff    = "ON" if on_raw == 1 else "OFF"
         return jsonify({'connected': True, 'msg': f'Temp: {temp_val:.1f}°C  Status: {onoff}', 'temp': temp_val})
     except Exception as e:
         return jsonify({'connected': False, 'msg': str(e)})
@@ -8406,272 +8262,6 @@ def handle_restart():  os.system('sudo reboot');          return jsonify({"statu
 @app.route('/power/shutdown', methods=['POST'])
 def handle_shutdown(): os.system('sudo shutdown -h now'); return jsonify({"status":"shutting down"})
 
-# ══════════════════════════════════════════════════════════════════════════════
-# VERSION · HEALTH · OVER-THE-AIR UPDATE
-# ══════════════════════════════════════════════════════════════════════════════
-def _read_json_file(path, default=None):
-    try:
-        with open(path) as f:
-            return json.load(f)
-    except Exception:
-        return default if default is not None else {}
-
-def _write_json_file(path, obj):
-    try:
-        tmp = path + ".tmp"
-        with open(tmp, "w") as f:
-            json.dump(obj, f)
-        os.replace(tmp, path)
-        return True
-    except Exception as e:
-        print(f"[UPDATE] state write failed: {e}", flush=True)
-        return False
-
-def _set_update_status(**kw):
-    with _update_lock:
-        _update_status.update(kw)
-        _update_status["ts"] = int(time.time())
-
-@app.route('/api/version')
-def api_version():
-    """Current firmware identity — shown in System Controls."""
-    return jsonify({"version": APP_VERSION, "build_date": APP_BUILD_DATE,
-                    "channel": APP_CHANNEL, "service": ENVI_SERVICE})
-
-@app.route('/api/health')
-def api_health():
-    """Machine-readable health for monitoring / heartbeat. Safe to poll."""
-    try:
-        cfg = load_device_config()
-        online = sum(1 for i in range(len(cfg))
-                     if i < len(all_ctrl_connected) and all_ctrl_connected[i])
-        total  = len(cfg)
-    except Exception:
-        online = total = 0
-    def _meminfo():
-        try:
-            mem = {}
-            with open('/proc/meminfo') as f:
-                for line in f:
-                    k, _, v = line.partition(':')
-                    mem[k.strip()] = int(v.strip().split()[0])  # kB
-            tot = mem.get('MemTotal', 0); avail = mem.get('MemAvailable', 0)
-            return round((tot - avail) / tot * 100, 1) if tot else None
-        except Exception:
-            return None
-    def _disk():
-        try:
-            st = os.statvfs('/')
-            used = (st.f_blocks - st.f_bfree) / st.f_blocks * 100
-            return round(used, 1)
-        except Exception:
-            return None
-    def _cputemp():
-        for p in ('/sys/class/thermal/thermal_zone0/temp',):
-            try:
-                with open(p) as f:
-                    return round(int(f.read().strip()) / 1000.0, 1)
-            except Exception:
-                pass
-        return None
-    return jsonify({
-        "status": "ok" if online == total and total > 0 else "degraded",
-        "version": APP_VERSION,
-        "uptime_sec": int(time.monotonic() - _app_start_mono),
-        "controllers_online": online, "controllers_total": total,
-        "clock_synced": bool(get_clock_source().get('synced')),
-        "mem_used_pct": _meminfo(), "disk_used_pct": _disk(),
-        "cpu_temp_c": _cputemp(),
-    })
-
-def _version_tuple(v):
-    out = []
-    for part in str(v).split('.'):
-        num = ''.join(ch for ch in part if ch.isdigit())
-        out.append(int(num) if num else 0)
-    return tuple(out) if out else (0,)
-
-def _is_newer(remote, local):
-    return _version_tuple(remote) > _version_tuple(local)
-
-def fetch_update_manifest(timeout=8):
-    """Download and parse the release manifest. Returns dict or None."""
-    import urllib.request
-    try:
-        req = urllib.request.Request(UPDATE_MANIFEST_URL,
-                                     headers={'Cache-Control': 'no-cache'})
-        with urllib.request.urlopen(req, timeout=timeout) as r:
-            data = json.loads(r.read().decode('utf-8', 'replace'))
-        # Support either a flat manifest or a {channel: manifest} map.
-        if isinstance(data, dict) and APP_CHANNEL in data and 'version' not in data:
-            data = data[APP_CHANNEL]
-        return data
-    except Exception as e:
-        print(f"[UPDATE] manifest fetch failed: {e}", flush=True)
-        return None
-
-@app.route('/api/check_update')
-def api_check_update():
-    """Check the manifest and report whether a newer version is available."""
-    m = fetch_update_manifest()
-    if not m or 'version' not in m:
-        _set_update_status(stage="idle", message="Could not reach update server",
-                           available=False, latest=None)
-        return jsonify({"ok": False, "error": "Could not reach update server",
-                        "current": APP_VERSION})
-    latest = str(m.get('version'))
-    avail  = _is_newer(latest, APP_VERSION)
-    _set_update_status(stage="idle", available=avail, latest=latest,
-                       changelog=m.get('changelog', ''),
-                       message=("Update available" if avail else "Up to date"))
-    return jsonify({"ok": True, "current": APP_VERSION, "latest": latest,
-                    "available": avail, "changelog": m.get('changelog', ''),
-                    "mandatory": bool(m.get('mandatory', False)),
-                    "size": m.get('size'), "date": m.get('date')})
-
-@app.route('/api/update_status')
-def api_update_status():
-    with _update_lock:
-        return jsonify(dict(_update_status))
-
-def _do_update(manifest):
-    """Download → verify checksum → syntax-check → back up → atomic swap → restart.
-       Any failure aborts safely and leaves the running version untouched."""
-    import urllib.request
-    url = manifest.get('url'); sha = (manifest.get('sha256') or '').lower().strip()
-    new_ver = str(manifest.get('version'))
-    if not url or not sha:
-        _set_update_status(stage="error", message="Manifest missing url/sha256", progress=0)
-        return
-    try:
-        _set_update_status(stage="downloading", message=f"Downloading v{new_ver}…", progress=5)
-        tmp = APP_FILE + ".new"
-        h = hashlib.sha256(); got = 0; total = int(manifest.get('size') or 0)
-        req = urllib.request.Request(url, headers={'Cache-Control': 'no-cache'})
-        with urllib.request.urlopen(req, timeout=30) as r, open(tmp, 'wb') as f:
-            while True:
-                chunk = r.read(65536)
-                if not chunk:
-                    break
-                f.write(chunk); h.update(chunk); got += len(chunk)
-                if total:
-                    _set_update_status(stage="downloading",
-                                       progress=min(70, 5 + int(got / total * 65)))
-        # 1) Integrity
-        _set_update_status(stage="verifying", message="Verifying checksum…", progress=78)
-        if h.hexdigest().lower() != sha:
-            os.remove(tmp)
-            _set_update_status(stage="error", message="Checksum mismatch — update rejected", progress=0)
-            return
-        # 2) Syntax pre-check — never swap in a file that can't even compile
-        _set_update_status(stage="verifying", message="Validating build…", progress=85)
-        rc = subprocess.run([sys.executable, "-m", "py_compile", tmp],
-                            capture_output=True, text=True)
-        if rc.returncode != 0:
-            os.remove(tmp)
-            _set_update_status(stage="error", message="New build failed validation — update rejected", progress=0)
-            return
-        # 3) Back up current, record state for boot-time rollback, atomic swap
-        _set_update_status(stage="installing", message="Installing…", progress=92)
-        try:
-            shutil.copy2(APP_FILE, APP_FILE + ".prev")
-        except Exception:
-            pass
-        _write_json_file(UPDATE_STATE_FILE, {
-            "stage": "pending", "from": APP_VERSION, "to": new_ver,
-            "boot_attempts": 0, "ts": int(time.time())})
-        os.replace(tmp, APP_FILE)                       # atomic
-        # 4) Restart the service so the new code takes over cleanly
-        _set_update_status(stage="restarting", message=f"Restarting into v{new_ver}…", progress=100)
-        time.sleep(1.5)
-        rc = run_priv(['systemctl', 'restart', ENVI_SERVICE], timeout=15)
-        if rc[0] != 0:
-            # Fallback: re-exec this process (new file is already in place)
-            print("[UPDATE] systemctl restart failed; re-exec", flush=True)
-            os.execv(sys.executable, [sys.executable, APP_FILE])
-    except Exception as e:
-        _set_update_status(stage="error", message=f"Update failed: {e}", progress=0)
-        print(f"[UPDATE] error: {e}", flush=True)
-
-@app.route('/api/apply_update', methods=['POST'])
-def api_apply_update():
-    """Kick off an update in the background. UI polls /api/update_status."""
-    with _update_lock:
-        if _update_status["stage"] in ("downloading", "verifying", "installing", "restarting"):
-            return jsonify({"ok": False, "error": "Update already in progress"})
-    m = fetch_update_manifest()
-    if not m or 'version' not in m:
-        return jsonify({"ok": False, "error": "Could not reach update server"})
-    if not _is_newer(str(m.get('version')), APP_VERSION):
-        return jsonify({"ok": False, "error": "Already up to date"})
-    threading.Thread(target=_do_update, args=(m,), daemon=True).start()
-    return jsonify({"ok": True, "message": "Update started"})
-
-def update_commit_watch():
-    """Boot-time half of the safe-update handshake. If we just booted into a
-       freshly-installed version, confirm the panel actually came up healthy and
-       mark the update COMMITTED. If the new build had crash-looped instead, the
-       service's ExecStartPre rollback (envi-rollback.sh) would already have
-       reverted APP_FILE before we ever got here — so reaching this code at all
-       means the new version runs."""
-    st = _read_json_file(UPDATE_STATE_FILE, {})
-    if st.get("stage") != "pending":
-        return
-    def _job():
-        import urllib.request
-        deadline = time.monotonic() + 60
-        healthy = False
-        while time.monotonic() < deadline:
-            try:
-                urllib.request.urlopen('http://127.0.0.1:5002/api/health', timeout=2)
-                healthy = True
-                break
-            except Exception:
-                time.sleep(3)
-        if healthy:
-            _write_json_file(UPDATE_STATE_FILE,
-                             {"stage": "committed", "version": APP_VERSION,
-                              "ts": int(time.time())})
-            print(f"[UPDATE] committed v{APP_VERSION}", flush=True)
-            # tidy the rollback backup once we're confident
-            try:
-                if os.path.exists(APP_FILE + ".prev"):
-                    os.remove(APP_FILE + ".prev")
-            except Exception:
-                pass
-    threading.Thread(target=_job, daemon=True).start()
-
-# ── systemd software watchdog heartbeat ─────────────────────────────────────
-def _sd_notify(msg):
-    """Send a datagram to systemd's notify socket (READY=1 / WATCHDOG=1 …).
-       No-op when not run under systemd. Zero external dependencies."""
-    addr = os.environ.get("NOTIFY_SOCKET")
-    if not addr:
-        return False
-    try:
-        s = socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM)
-        if addr.startswith('@'):                 # abstract namespace
-            addr = '\0' + addr[1:]
-        s.connect(addr)
-        s.sendall(msg.encode())
-        s.close()
-        return True
-    except Exception:
-        return False
-
-def systemd_watchdog_thread():
-    """Tell systemd we're alive. If the app hangs, systemd (WatchdogSec=) restarts
-       it; if the whole board wedges, the hardware watchdog reboots it."""
-    _sd_notify("READY=1")
-    usec = os.environ.get("WATCHDOG_USEC")
-    interval = (int(usec) / 1_000_000 / 2) if usec else 15   # ping at half the timeout
-    while True:
-        try:
-            _sd_notify("WATCHDOG=1")
-        except Exception:
-            pass
-        time.sleep(max(2, interval))
-
 @app.route('/send-log', methods=['POST'])
 def send_log():
     data = request.get_json(silent=True) or {}
@@ -8817,9 +8407,7 @@ if __name__ == '__main__':
 
     threading.Thread(target=open_browser, daemon=True).start()
     threading.Thread(target=kiosk_watchdog_thread, daemon=True, name="KioskWatch").start()
-    threading.Thread(target=systemd_watchdog_thread, daemon=True, name="Watchdog").start()
-    update_commit_watch()   # confirm & commit a just-installed update (or it self-rolls-back)
 
-    print(f"All threads started. ENVI Central v{APP_VERSION} serving at http://0.0.0.0:5002", flush=True)
+    print("All threads started. Serving at http://0.0.0.0:5002", flush=True)
 
     app.run(host='0.0.0.0', port=5002, debug=False, use_reloader=False, threaded=True)
