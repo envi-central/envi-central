@@ -28,7 +28,7 @@ import sqlite3
 # ══════════════════════════════════════════════════════════════════════════════
 # PRODUCT VERSION & OVER-THE-AIR UPDATE / HEALTH CONFIG
 # ══════════════════════════════════════════════════════════════════════════════
-APP_VERSION    = "1.5.0"                    # bump on every release
+APP_VERSION    = "1.5.1"                    # bump on every release
 APP_BUILD_DATE = "2026-07-22"              # release/build date
 APP_CHANNEL    = "stable"                   # stable | beta
 
